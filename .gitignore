@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.env.*
+!.env.example
+social.env
+data/
+storage/
+.pytest_cache/
+*.egg-info/
+.coverage
