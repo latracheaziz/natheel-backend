@@ -84,7 +84,7 @@ def _public_url(request: Request, key: str) -> str:
     return f"{base.rstrip('/')}/{key}"
 
 
-@router.get("/status", summary="Which networks have credentials in social.env")
+@router.get("/status", summary="Which networks have credentials in .env")
 async def credential_status() -> dict:
     creds = get_social_credentials()
     ready = creds.platform_ready()
@@ -92,7 +92,7 @@ async def credential_status() -> dict:
     if creds.filled("snapchat_profile_id") or creds.filled("snapchat_client_id") or creds.filled("snapchat_access_token"):
         details["snapchat"] = await snapchat_account_check(creds)
     return {
-        "credentials_file": "social.env",
+        "credentials_file": ".env",
         "platforms": ready,
         "details": details,
     }

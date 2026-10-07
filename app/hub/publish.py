@@ -48,7 +48,7 @@ class HubContent:
 def _missing(platform: str, keys: str) -> PlatformResult:
     return PlatformResult(
         platform, "missing_credentials",
-        f"أضف القيم في الملف social.env ثم أعد النشر: {keys}",
+        f"أضف القيم في الملف .env ثم أعد النشر: {keys}",
     )
 
 
@@ -76,7 +76,7 @@ def is_public_http_url(url: str | None) -> bool:
 def _public_media_message(platform_name: str) -> str:
     return (
         f"{platform_name} يجب أن يحمّل الصورة أو الفيديو من رابط HTTPS عام. "
-        "ضع MEDIA_PUBLIC_BASE_URL في social.env (رابط عام يصل إلى هذا الخادم)، "
+        "ضع MEDIA_PUBLIC_BASE_URL في .env (رابط عام يصل إلى هذا الخادم)، "
         "أو أرفق رابط فيديو/صورة عاماً."
     )
 
@@ -343,7 +343,7 @@ async def _publish_youtube(content: HubContent, creds: SocialCredentials, client
     except RuntimeError as exc:
         return _failed("youtube", str(exc))
     if not token:
-        return _failed("youtube", "تعذر الحصول على رمز يوتيوب من social.env.")
+        return _failed("youtube", "تعذر الحصول على رمز يوتيوب من .env.")
     privacy = creds.youtube_privacy_status.strip() or "public"
     if privacy not in {"public", "unlisted", "private"}:
         privacy = "public"
@@ -505,10 +505,10 @@ _SNAPCHAT_CHUNK = 32 * 1024 * 1024
 
 
 def _snapchat_token_message() -> str:
-    return "أضف SNAPCHAT_CLIENT_ID و SNAPCHAT_ACCESS_TOKEN و SNAPCHAT_PROFILE_ID في social.env."
+    return "أضف SNAPCHAT_CLIENT_ID و SNAPCHAT_ACCESS_TOKEN و SNAPCHAT_PROFILE_ID في .env."
 
 
-# Fresh access tokens live only in this process. social.env keeps the long-lived OAuth values.
+# Fresh access tokens live only in this process. .env keeps the long-lived OAuth values.
 _snapchat_access_cache: dict[str, tuple[str, float]] = {}
 
 
@@ -526,7 +526,7 @@ def _encrypt_snapchat_media(data: bytes) -> tuple[bytes, str, str]:
 
 
 def _snapchat_oauth_material(creds: SocialCredentials) -> tuple[str, str, str]:
-    """Client id, client secret, and the long-lived refresh token from social.env."""
+    """Client id, client secret, and the long-lived refresh token from .env."""
     client_id = creds.snapchat_client_id.strip()
     client_secret = creds.snapchat_client_secret.strip()
     # Business Manager may place the long-lived OAuth token in either field.
@@ -588,7 +588,7 @@ def _snapchat_failed(response: httpx.Response, creds: SocialCredentials) -> Plat
 async def snapchat_account_check(creds: SocialCredentials) -> dict:
     """Confirm a freshly generated Snapchat token can read the public profile. Does not post."""
     if not creds.filled("snapchat_profile_id"):
-        return {"ok": False, "message": "أضف SNAPCHAT_PROFILE_ID في social.env"}
+        return {"ok": False, "message": "أضف SNAPCHAT_PROFILE_ID في .env"}
     profile = creds.snapchat_profile_id.strip()
     timeout = httpx.Timeout(20.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:

@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
-CREDENTIALS_FILE = BACKEND_ROOT / "social.env"
+CREDENTIALS_FILE = BACKEND_ROOT / ".env"
 
 
 class SocialCredentials(BaseSettings):
