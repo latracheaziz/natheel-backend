@@ -1,4 +1,10 @@
-"""Live, nullable social analytics. No synthetic values are produced."""
+"""Live, nullable social analytics. No synthetic values are produced.
+
+Facebook, Instagram, X, YouTube, Pinterest, TikTok, and Threads are connected through Zoho
+Social, which does not expose follower counts in its API — only connection status, name, and
+avatar per channel. Only LinkedIn and Snapchat (not Zoho-managed) still report real follower
+counts, fetched directly from their own APIs.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,13 +16,9 @@ import httpx
 from sqlalchemy import text
 
 from app.core.database import get_sessionmaker
+from app.hub import zoho_social
 from app.hub.credentials import SocialCredentials, get_social_credentials
-from app.hub.publish import (
-    _error_text,
-    _oauth1_header,
-    _snapchat_bearer,
-    _youtube_token,
-)
+from app.hub.publish import _error_text, _snapchat_bearer
 from app.hub.store import list_posts
 
 PLATFORM_NAMES = {
@@ -27,6 +29,8 @@ PLATFORM_NAMES = {
     "twitter": "إكس",
     "pinterest": "بنترست",
     "youtube": "يوتيوب",
+    "facebook": "فيسبوك",
+    "threads": "ثريدز",
 }
 
 
@@ -75,120 +79,40 @@ def _ready(platform: str, data: dict, raw: dict) -> dict:
     }
 
 
-async def _instagram(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
-    if not c.filled("meta_page_access_token", "instagram_business_account_id"):
-        return _empty("instagram", "بيانات اعتماد إنستغرام غير مكتملة.")
-    url = f"https://graph.facebook.com/{c.meta_graph_version.strip()}/{c.instagram_business_account_id.strip()}"
-    response = await client.get(
-        url,
-        params={
-            "fields": "username,followers_count,follows_count,media_count",
-            "access_token": c.meta_page_access_token.strip(),
-        },
-    )
-    if response.status_code >= 400:
-        return _empty("instagram", _error_text(response), connected=True)
-    body = response.json()
-    return _ready("instagram", {
-        "username": body.get("username"),
-        "followers_count": body.get("followers_count"),
-        "following_count": body.get("follows_count"),
-        "posts_count": body.get("media_count"),
-    }, body)
-
-
-async def _tiktok(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
-    if not c.filled("tiktok_access_token"):
-        return _empty("tiktok", "TIKTOK_ACCESS_TOKEN غير موجود.")
-    response = await client.get(
-        "https://open.tiktokapis.com/v2/user/info/",
-        params={"fields": "display_name,username,follower_count,following_count,likes_count,video_count"},
-        headers={"Authorization": f"Bearer {c.tiktok_access_token.strip()}"},
-    )
-    if response.status_code >= 400:
-        return _empty("tiktok", _error_text(response), connected=True)
-    body = response.json()
-    error = body.get("error") or {}
-    if error.get("code") not in {None, "", "ok"}:
-        return _empty("tiktok", str(error.get("message") or error), connected=True)
-    user = ((body.get("data") or {}).get("user") or {})
-    return _ready("tiktok", {
-        "username": user.get("username") or user.get("display_name"),
-        "followers_count": user.get("follower_count"),
-        "following_count": user.get("following_count"),
-        "posts_count": user.get("video_count"),
-        "likes_count": user.get("likes_count"),
-    }, body)
-
-
-async def _youtube(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
-    if not (
-        c.filled("youtube_access_token")
-        or c.filled("youtube_refresh_token", "google_client_id", "google_client_secret")
-    ):
-        return _empty("youtube", "بيانات اعتماد يوتيوب غير مكتملة.")
+async def _zoho_channels_safe(client: httpx.AsyncClient, c: SocialCredentials) -> list[dict]:
+    if not c.zoho_ready():
+        return []
     try:
-        token = await _youtube_token(client, c)
-    except Exception as exc:
-        return _empty("youtube", str(exc), connected=True)
-    response = await client.get(
-        "https://www.googleapis.com/youtube/v3/channels",
-        params={"part": "snippet,statistics", "mine": "true"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    if response.status_code >= 400:
-        return _empty("youtube", _error_text(response), connected=True)
-    body = response.json()
-    item = next(iter(body.get("items") or []), {})
-    stats = item.get("statistics") or {}
-    return _ready("youtube", {
-        "username": (item.get("snippet") or {}).get("title"),
-        "followers_count": int(stats["subscriberCount"]) if stats.get("subscriberCount") is not None else None,
-        "posts_count": int(stats["videoCount"]) if stats.get("videoCount") is not None else None,
-        "views_count": int(stats["viewCount"]) if stats.get("viewCount") is not None else None,
-    }, body)
+        return await zoho_social.get_channels(client, c)
+    except Exception:
+        return []
 
 
-async def _pinterest(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
-    if not c.filled("pinterest_access_token"):
-        return _empty("pinterest", "PINTEREST_ACCESS_TOKEN غير موجود.")
-    response = await client.get(
-        "https://api.pinterest.com/v5/user_account",
-        headers={"Authorization": f"Bearer {c.pinterest_access_token.strip()}"},
-    )
-    if response.status_code >= 400:
-        return _empty("pinterest", _error_text(response), connected=True)
-    body = response.json()
-    return _ready("pinterest", {
-        "username": body.get("username"),
-        "followers_count": body.get("follower_count"),
-        "following_count": body.get("following_count"),
-        "posts_count": body.get("pin_count"),
-    }, body)
+def _zoho_account_entry(platform: str, channel: dict) -> dict:
+    connected = channel.get("status") == "token_active"
+    return {
+        "platform": platform,
+        "name": PLATFORM_NAMES[platform],
+        "connected": connected,
+        "available": False,
+        "reason": (
+            "عدد المتابعين غير متوفر عبر واجهة Zoho Social الحالية (تعرض الاسم والحالة فقط)."
+            if connected else f"الحالة في Zoho Social: {channel.get('status') or 'غير معروفة'}"
+        ),
+        "username": channel.get("name"),
+        "followers_count": None,
+        "following_count": None,
+        "posts_count": None,
+        "likes_count": None,
+        "views_count": None,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "raw": channel,
+    }
 
 
-async def _twitter(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
-    if not c.filled("x_api_key", "x_api_secret", "x_access_token", "x_access_token_secret"):
-        return _empty("twitter", "مفاتيح OAuth 1.0a لمنصة إكس غير مكتملة.")
-    url = "https://api.twitter.com/2/users/me"
-    query = {"user.fields": "public_metrics,username,name"}
-    response = await client.get(
-        url,
-        params=query,
-        headers={"Authorization": _oauth1_header("GET", url, c, query)},
-    )
-    if response.status_code >= 400:
-        return _empty("twitter", _error_text(response), connected=True)
-    body = response.json()
-    user = body.get("data") or {}
-    metrics = user.get("public_metrics") or {}
-    return _ready("twitter", {
-        "username": user.get("username"),
-        "followers_count": metrics.get("followers_count"),
-        "following_count": metrics.get("following_count"),
-        "posts_count": metrics.get("tweet_count"),
-        "likes_count": metrics.get("like_count"),
-    }, body)
+
+
+
 
 
 async def _linkedin(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
@@ -248,22 +172,27 @@ async def _snapchat(client: httpx.AsyncClient, c: SocialCredentials) -> dict:
 async def _account_metrics(c: SocialCredentials) -> list[dict]:
     timeout = httpx.Timeout(30.0, read=60.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        calls = (
-            _tiktok(client, c),
+        channels, snapchat_metric, linkedin_metric = await asyncio.gather(
+            _zoho_channels_safe(client, c),
             _snapchat(client, c),
-            _instagram(client, c),
             _linkedin(client, c),
-            _twitter(client, c),
-            _pinterest(client, c),
-            _youtube(client, c),
+            return_exceptions=True,
         )
-        results = await asyncio.gather(*calls, return_exceptions=True)
-    metrics: list[dict] = []
-    for platform, result in zip(PLATFORM_NAMES, results):
-        if isinstance(result, Exception):
-            metrics.append(_empty(platform, str(result)))
+    if isinstance(channels, Exception):
+        channels = []
+    channel_by_network = {item.get("network"): item for item in channels if item.get("network")}
+    metrics: list[dict] = [
+        linkedin_metric if not isinstance(linkedin_metric, Exception) else _empty("linkedin", str(linkedin_metric)),
+        snapchat_metric if not isinstance(snapchat_metric, Exception) else _empty("snapchat", str(snapchat_metric)),
+    ]
+    for platform, network in zoho_social.NETWORK_MAP.items():
+        channel = channel_by_network.get(network)
+        if channel is not None:
+            metrics.append(_zoho_account_entry(platform, channel))
+        elif c.zoho_ready():
+            metrics.append(_empty(platform, "غير متصل داخل Zoho Social حالياً."))
         else:
-            metrics.append(result)
+            metrics.append(_empty(platform, "Zoho Social غير مُهيّأ في .env."))
     return metrics
 
 
@@ -287,27 +216,7 @@ async def _post_metric(client: httpx.AsyncClient, c: SocialCredentials, post: di
         base["reason"] = "لا يوجد معرّف منشور منشور على المنصة."
         return base
     response: httpx.Response | None = None
-    if platform == "instagram" and c.filled("meta_page_access_token"):
-        response = await client.get(
-            f"https://graph.facebook.com/{c.meta_graph_version.strip()}/{external_id}",
-            params={"fields": "like_count,comments_count", "access_token": c.meta_page_access_token.strip()},
-        )
-    elif platform == "twitter" and c.filled("x_api_key", "x_api_secret", "x_access_token", "x_access_token_secret"):
-        url = f"https://api.twitter.com/2/tweets/{external_id}"
-        query = {"tweet.fields": "public_metrics"}
-        response = await client.get(url, params=query, headers={"Authorization": _oauth1_header("GET", url, c, query)})
-    elif platform == "youtube":
-        try:
-            token = await _youtube_token(client, c)
-            response = await client.get(
-                "https://www.googleapis.com/youtube/v3/videos",
-                params={"part": "statistics", "id": external_id},
-                headers={"Authorization": f"Bearer {token}"},
-            )
-        except Exception as exc:
-            base["reason"] = str(exc)
-            return base
-    elif platform == "linkedin" and c.filled("linkedin_access_token"):
+    if platform == "linkedin" and c.filled("linkedin_access_token"):
         response = await client.get(
             f"https://api.linkedin.com/rest/socialActions/{quote(external_id, safe='')}",
             headers={
@@ -317,35 +226,19 @@ async def _post_metric(client: httpx.AsyncClient, c: SocialCredentials, post: di
             },
         )
     else:
+        # Facebook, Instagram, X, YouTube, Pinterest, TikTok, and Threads are published
+        # through Zoho; their live engagement numbers come from the Zoho-sourced recent
+        # posts feed (GET /api/hub/posts) directly, not from this per-network lookup.
         base["reason"] = "المنصة لا توفر مقاييس هذا المنشور بالصلاحيات الحالية."
         return base
     if response.status_code >= 400:
         base["reason"] = _error_text(response)
         return base
     body = response.json()
-    values: dict = {}
-    if platform == "instagram":
-        values = {"likes_count": body.get("like_count"), "comments_count": body.get("comments_count")}
-    elif platform == "twitter":
-        metric = ((body.get("data") or {}).get("public_metrics") or {})
-        values = {
-            "likes_count": metric.get("like_count"),
-            "comments_count": metric.get("reply_count"),
-            "shares_count": metric.get("retweet_count"),
-            "views_count": metric.get("impression_count"),
-        }
-    elif platform == "youtube":
-        metric = (next(iter(body.get("items") or []), {}).get("statistics") or {})
-        values = {
-            "likes_count": int(metric["likeCount"]) if metric.get("likeCount") is not None else None,
-            "comments_count": int(metric["commentCount"]) if metric.get("commentCount") is not None else None,
-            "views_count": int(metric["viewCount"]) if metric.get("viewCount") is not None else None,
-        }
-    elif platform == "linkedin":
-        values = {
-            "likes_count": (body.get("likesSummary") or {}).get("totalLikes"),
-            "comments_count": (body.get("commentsSummary") or {}).get("totalFirstLevelComments"),
-        }
+    values = {
+        "likes_count": (body.get("likesSummary") or {}).get("totalLikes"),
+        "comments_count": (body.get("commentsSummary") or {}).get("totalFirstLevelComments"),
+    }
     base.update(values)
     base.update({"available": True, "reason": None, "raw": body})
     return base

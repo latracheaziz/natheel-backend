@@ -1,4 +1,4 @@
-"""Social network credentials, loaded only from social.env (never from the frontend)."""
+"""Social network credentials, loaded only from backend/.env (never from the frontend)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -18,37 +18,36 @@ class SocialCredentials(BaseSettings):
 
     media_public_base_url: str = ""
 
-    meta_graph_version: str = "v21.0"
-    meta_page_id: str = ""
-    meta_page_access_token: str = ""
-    instagram_business_account_id: str = ""
-
+    # LinkedIn and Snapchat are the only networks NOT connected inside Zoho Social, so they
+    # keep their own direct tokens here. Every other network (Facebook, Instagram, X,
+    # YouTube, Pinterest, TikTok, Threads) is published exclusively through Zoho below —
+    # there is no direct-API fallback for them anymore.
     linkedin_access_token: str = ""
     linkedin_author_urn: str = ""
     linkedin_api_version: str = "202506"
-
-    x_api_key: str = ""
-    x_api_secret: str = ""
-    x_access_token: str = ""
-    x_access_token_secret: str = ""
-
-    tiktok_access_token: str = ""
-    tiktok_privacy_level: str = "SELF_ONLY"
-
-    youtube_access_token: str = ""
-    youtube_refresh_token: str = ""
-    google_client_id: str = ""
-    google_client_secret: str = ""
-    youtube_privacy_status: str = "public"
-
-    pinterest_access_token: str = ""
-    pinterest_board_id: str = ""
 
     snapchat_client_id: str = ""
     snapchat_client_secret: str = ""
     snapchat_refresh_token: str = ""
     snapchat_access_token: str = ""
     snapchat_profile_id: str = ""
+
+    # Zoho Social — unified publishing + the list of channels already connected there.
+    # Docs: https://www.zoho.com/social/api/introduction.html
+    zoho_client_id: str = ""
+    zoho_client_secret: str = ""
+    zoho_refresh_token: str = ""
+    zoho_accounts_url: str = "https://accounts.zoho.com"  # per-datacenter accounts server
+    zoho_api_domain: str = "https://social.zoho.com"       # per-datacenter Social API domain
+    zoho_portal_id: str = ""
+    zoho_brand_id: str = ""
+    # Which hub platforms are routed through Zoho instead of their direct API. Comma separated
+    # Zoho network identifiers (tiktok, twitter, youtube, facebookpage, instagram, pinterest,
+    # threadsbyig, linkedinpage, ...). Defaults to every network already connected in the portal.
+    zoho_networks: str = "tiktok,twitter,youtube,facebookpage,instagram,pinterest,threadsbyig"
+    # Optional: pin posts to one Pinterest board. Zoho requires a board_id for Pinterest; when
+    # this is empty the hub asks Zoho for the brand's first board and reuses it.
+    zoho_pinterest_board_id: str = ""
 
     def filled(self, *names: str) -> bool:
         return all(str(getattr(self, name, "")).strip() for name in names)
@@ -59,19 +58,26 @@ class SocialCredentials(BaseSettings):
             return author
         return f"urn:li:person:{author}"
 
+    def zoho_ready(self) -> bool:
+        return self.filled(
+            "zoho_client_id", "zoho_client_secret", "zoho_refresh_token", "zoho_portal_id", "zoho_brand_id")
+
     def platform_ready(self) -> dict[str, bool]:
+        zoho = self.zoho_ready()
         return {
-            "instagram": self.filled("meta_page_access_token", "instagram_business_account_id"),
+            "facebook": zoho,
+            "instagram": zoho,
             "linkedin": self.filled("linkedin_access_token", "linkedin_author_urn"),
-            "twitter": self.filled("x_api_key", "x_api_secret", "x_access_token", "x_access_token_secret"),
-            "tiktok": self.filled("tiktok_access_token"),
-            "youtube": self.filled("youtube_access_token") or self.filled(
-                "youtube_refresh_token", "google_client_id", "google_client_secret"),
-            "pinterest": self.filled("pinterest_access_token", "pinterest_board_id"),
+            "twitter": zoho,
+            "tiktok": zoho,
+            "youtube": zoho,
+            "pinterest": zoho,
+            "threads": zoho,
             "snapchat": self.filled("snapchat_profile_id") and (
                 self.filled("snapchat_access_token")
                 or self.filled("snapchat_client_id", "snapchat_client_secret", "snapchat_refresh_token")
             ),
+            "zoho_social": zoho,
         }
 
 

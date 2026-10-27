@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Reque
 
 from app.api.routes.reviews import require_admin_token
 from app.core.config import get_settings
+from app.hub import zoho_social
 from app.hub.analytics import analytics_history, sync_social_analytics
 from app.hub.credentials import CREDENTIALS_FILE, get_social_credentials
 from app.hub.publish import PLATFORMS, HubContent, is_public_http_url, publish_everywhere, snapchat_account_check
@@ -91,16 +92,51 @@ async def credential_status() -> dict:
     details: dict = {}
     if creds.filled("snapchat_profile_id") or creds.filled("snapchat_client_id") or creds.filled("snapchat_access_token"):
         details["snapchat"] = await snapchat_account_check(creds)
+    if creds.zoho_ready():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            details["zoho_social"] = await zoho_social.channel_check(client, creds)
     return {
         "credentials_file": ".env",
         "platforms": ready,
+        "zoho_managed_platforms": sorted(zoho_social.managed_platforms(creds)),
         "details": details,
     }
 
 
-@router.get("/posts", summary="Posts created on this platform")
+@router.get("/zoho/channels", summary="Social accounts already connected inside Zoho Social")
+async def zoho_channels() -> dict:
+    """Live list from Zoho (not from .env): every channel the connected Zoho Social
+    portal/brand already has linked, so the admin can see what will actually receive
+    a post without opening the Zoho Social console."""
+    creds = get_social_credentials()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+        return await zoho_social.channel_check(client, creds)
+
+
+@router.get("/posts", summary="Posts created on this platform, merged with Zoho's live feed")
 async def posts() -> dict:
-    return {"posts": list_posts()}
+    """Our local record (every post made through this composer, any platform) plus Zoho
+    Social's own live "Published Posts" feed (any Zoho-managed network, even posts made
+    outside this tool), de-duplicated by the network's real post id."""
+    creds = get_social_credentials()
+    local = [{**post, "source": "local"} for post in list_posts()]
+    known_ids = {
+        str(result.get("external_id"))
+        for post in local
+        for result in post.get("results") or []
+        if result.get("external_id")
+    }
+    zoho_posts: list[dict] = []
+    if creds.zoho_ready():
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+            try:
+                zoho_posts = await zoho_social.recent_posts(client, creds)
+            except Exception:
+                zoho_posts = []
+    zoho_posts = [post for post in zoho_posts if post.get("external_id") not in known_ids]
+    combined = local + zoho_posts
+    combined.sort(key=lambda post: post.get("published_at") or post.get("created_at") or "", reverse=True)
+    return {"posts": combined}
 
 
 @router.get("/analytics", summary="Fetch real metrics from connected social providers")
@@ -120,9 +156,21 @@ async def metric_history() -> dict:
 
 @router.delete("/posts/{post_id}", summary="Delete a platform post record")
 async def remove_post(post_id: str) -> dict:
-    if not delete_post(post_id):
+    """Removes the post from our own local record. Zoho Social has no API to delete an
+    already-published post (only drafts/schedules) — so posts sourced live from Zoho
+    (id starting with "zoho:") have nothing local to delete; the frontend instead opens
+    the post's real network/Zoho link so it can be removed manually from there."""
+    if post_id.startswith("zoho:"):
+        raise HTTPException(
+            status_code=400,
+            detail="هذا المنشور من Zoho Social مباشرة ولا يوجد سجل محلي له. "
+                   "Zoho لا يوفر واجهة لحذف منشور نُشر فعلاً؛ افتح رابط المنشور لحذفه يدوياً.",
+        )
+    existing = next((item for item in list_posts() if item.get("id") == post_id), None)
+    if existing is None or not delete_post(post_id):
         raise HTTPException(status_code=404, detail="المنشور غير موجود.")
-    return {"success": True, "id": post_id}
+    manage_links = [item.get("url") for item in (existing.get("results") or []) if item.get("url")]
+    return {"success": True, "id": post_id, "manage_links": manage_links}
 
 
 @router.post("/posts", summary="Create a post and share it to the selected networks")

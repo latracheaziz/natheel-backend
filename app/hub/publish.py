@@ -1,20 +1,29 @@
-"""Publish one hub post to the social networks selected in the admin form."""
+"""Publish one hub post to the social networks selected in the admin form.
+
+Facebook, Instagram, X, YouTube, Pinterest, TikTok, and Threads are published exclusively
+through the connected Zoho Social portal (see `zoho_social.py`) — there is no direct-API
+fallback for them here anymore. Only LinkedIn and Snapchat, which are not connected inside
+Zoho, still call their own network APIs directly below.
+"""
 from __future__ import annotations
 
 import base64
 import hashlib
-import hmac
 import secrets
 import time
 from dataclasses import asdict, dataclass
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import httpx
 
+from app.hub import zoho_social
 from app.hub.credentials import SocialCredentials
 from app.integrations.social.linkedin import escape_commentary
 
-PLATFORMS = ("tiktok", "snapchat", "instagram", "linkedin", "twitter", "pinterest", "youtube")
+PLATFORMS = (
+    "tiktok", "snapchat", "instagram", "linkedin", "twitter", "pinterest", "youtube",
+    "facebook", "threads",
+)
 
 
 @dataclass
@@ -99,122 +108,6 @@ def _error_text(response: httpx.Response) -> str:
     return (response.text or f"HTTP {response.status_code}")[:300]
 
 
-def _oauth1_header(method: str, url: str, creds: SocialCredentials, extra: dict | None = None) -> str:
-    oauth = {
-        "oauth_consumer_key": creds.x_api_key.strip(),
-        "oauth_nonce": secrets.token_hex(16),
-        "oauth_signature_method": "HMAC-SHA1",
-        "oauth_timestamp": str(int(time.time())),
-        "oauth_token": creds.x_access_token.strip(),
-        "oauth_version": "1.0",
-    }
-    collected = {**oauth, **(extra or {})}
-
-    def enc(value: str) -> str:
-        return quote(str(value), safe="")
-
-    param_string = "&".join(f"{enc(key)}={enc(collected[key])}" for key in sorted(collected))
-    base = "&".join([method.upper(), enc(url.split("?")[0]), enc(param_string)])
-    signing_key = f"{enc(creds.x_api_secret.strip())}&{enc(creds.x_access_token_secret.strip())}"
-    signature = base64.b64encode(hmac.new(signing_key.encode(), base.encode(), hashlib.sha1).digest()).decode()
-    oauth["oauth_signature"] = signature
-    return "OAuth " + ", ".join(f'{enc(key)}="{enc(oauth[key])}"' for key in sorted(oauth))
-
-
-async def _youtube_token(client: httpx.AsyncClient, creds: SocialCredentials) -> str:
-    if creds.youtube_access_token.strip():
-        return creds.youtube_access_token.strip()
-    response = await client.post("https://oauth2.googleapis.com/token", data={
-        "client_id": creds.google_client_id.strip(),
-        "client_secret": creds.google_client_secret.strip(),
-        "refresh_token": creds.youtube_refresh_token.strip(),
-        "grant_type": "refresh_token",
-    })
-    if response.status_code >= 400:
-        raise RuntimeError(_error_text(response))
-    return str(response.json().get("access_token") or "")
-
-
-async def _publish_twitter(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
-    keys = "X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET"
-    if not creds.filled("x_api_key", "x_api_secret", "x_access_token", "x_access_token_secret"):
-        return _missing("twitter", keys)
-    media_ids: list[str] = []
-    if content.video_bytes:
-        media_ids.append(await _twitter_video(client, creds, content.video_bytes, content.video_mime or "video/mp4"))
-    elif content.image_bytes:
-        media_ids.append(await _twitter_image(client, creds, content.image_bytes))
-    text = content.caption.strip()
-    if len(text) > 280:
-        text = text[:277] + "..."
-    body: dict = {}
-    if text:
-        body["text"] = text
-    if media_ids:
-        body["media"] = {"media_ids": media_ids}
-    if not body:
-        return _unsupported("twitter", "أضف نصاً أو صورة أو فيديو.")
-    response = await client.post(
-        "https://api.twitter.com/2/tweets",
-        json=body,
-        headers={"Authorization": _oauth1_header("POST", "https://api.twitter.com/2/tweets", creds)},
-    )
-    if response.status_code >= 400:
-        return _failed("twitter", _error_text(response))
-    tweet_id = str(response.json().get("data", {}).get("id") or "")
-    note = "تم النشر" if len(content.caption.strip()) <= 280 else "تم النشر بعد اختصار النص إلى 280 حرفاً لقيود منصة إكس."
-    return _published("twitter", tweet_id, f"https://x.com/i/status/{tweet_id}" if tweet_id else None, note)
-
-
-async def _twitter_image(client: httpx.AsyncClient, creds: SocialCredentials, data: bytes) -> str:
-    url = "https://upload.twitter.com/1.1/media/upload.json"
-    response = await client.post(
-        url,
-        files={"media": ("image", data)},
-        headers={"Authorization": _oauth1_header("POST", url, creds)},
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(_error_text(response))
-    return str(response.json()["media_id_string"])
-
-
-async def _twitter_video(client: httpx.AsyncClient, creds: SocialCredentials, data: bytes, mime: str) -> str:
-    url = "https://upload.twitter.com/1.1/media/upload.json"
-    init = {"command": "INIT", "total_bytes": str(len(data)), "media_type": mime, "media_category": "tweet_video"}
-    opened = await client.post(url, data=init, headers={"Authorization": _oauth1_header("POST", url, creds, init)})
-    if opened.status_code >= 400:
-        raise RuntimeError(_error_text(opened))
-    media_id = str(opened.json()["media_id_string"])
-    chunk = 4 * 1024 * 1024
-    for index, start in enumerate(range(0, len(data), chunk)):
-        append = {"command": "APPEND", "media_id": media_id, "segment_index": str(index)}
-        part = await client.post(
-            url,
-            data=append,
-            files={"media": ("video", data[start:start + chunk], mime)},
-            headers={"Authorization": _oauth1_header("POST", url, creds)},
-        )
-        if part.status_code >= 400:
-            raise RuntimeError(_error_text(part))
-    finalize = {"command": "FINALIZE", "media_id": media_id}
-    closed = await client.post(url, data=finalize, headers={"Authorization": _oauth1_header("POST", url, creds, finalize)})
-    if closed.status_code >= 400:
-        raise RuntimeError(_error_text(closed))
-    processing = closed.json().get("processing_info")
-    for _ in range(20):
-        if not processing or processing.get("state") in {None, "succeeded"}:
-            return media_id
-        if processing.get("state") == "failed":
-            raise RuntimeError(str(processing.get("error") or "Twitter failed to process the video."))
-        await _sleep(float(processing.get("check_after_secs") or 2))
-        status = {"command": "STATUS", "media_id": media_id}
-        polled = await client.get(url, params=status, headers={"Authorization": _oauth1_header("GET", url, creds, status)})
-        if polled.status_code >= 400:
-            raise RuntimeError(_error_text(polled))
-        processing = polled.json().get("processing_info")
-    raise RuntimeError("Twitter is still processing the video.")
-
-
 async def _publish_linkedin(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
     if not creds.filled("linkedin_access_token", "linkedin_author_urn"):
         return _missing("linkedin", "LINKEDIN_ACCESS_TOKEN, LINKEDIN_AUTHOR_URN")
@@ -291,213 +184,6 @@ async def _linkedin_video(client: httpx.AsyncClient, headers: dict, author: str,
     if finalized.status_code >= 400:
         raise RuntimeError(_error_text(finalized))
     return value["video"]
-
-
-async def _publish_instagram(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
-    if not creds.filled("meta_page_access_token", "instagram_business_account_id"):
-        return _missing("instagram", "META_PAGE_ACCESS_TOKEN, INSTAGRAM_BUSINESS_ACCOUNT_ID")
-    if content.video_bytes or content.video_url:
-        if not is_public_http_url(content.video_url):
-            return _failed("instagram", _public_media_message("إنستغرام"))
-        fields = {"media_type": "REELS", "video_url": content.video_url, "caption": content.caption}
-    elif content.image_bytes or content.image_url:
-        if not is_public_http_url(content.image_url):
-            return _failed("instagram", _public_media_message("إنستغرام"))
-        fields = {"image_url": content.image_url, "caption": content.caption}
-    else:
-        return _unsupported("instagram", "إنستغرام يتطلب صورة أو فيديو. النص وحده غير مدعوم.")
-    graph = f"https://graph.facebook.com/{creds.meta_graph_version.strip() or 'v21.0'}"
-    account = creds.instagram_business_account_id.strip()
-    token = creds.meta_page_access_token.strip()
-    created = await client.post(f"{graph}/{account}/media", data={**fields, "access_token": token})
-    if created.status_code >= 400:
-        return _failed("instagram", _error_text(created))
-    container = str(created.json().get("id") or "")
-    for _ in range(15):
-        status = await client.get(f"{graph}/{container}", params={"fields": "status_code", "access_token": token})
-        code = (status.json().get("status_code") if status.status_code < 400 else "") or ""
-        if code == "FINISHED":
-            break
-        if code == "ERROR":
-            return _failed("instagram", _error_text(status))
-        await _sleep(3)
-    else:
-        return _failed("instagram", "إنستغرام ما زال يعالج الوسائط. أعد المحاولة بعد لحظات.")
-    published = await client.post(
-        f"{graph}/{account}/media_publish", data={"creation_id": container, "access_token": token})
-    if published.status_code >= 400:
-        return _failed("instagram", _error_text(published))
-    post_id = str(published.json().get("id") or container)
-    return _published("instagram", post_id, f"https://www.instagram.com/")
-
-
-async def _publish_youtube(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
-    ready = creds.filled("youtube_access_token") or creds.filled(
-        "youtube_refresh_token", "google_client_id", "google_client_secret")
-    if not ready:
-        return _missing("youtube", "YOUTUBE_ACCESS_TOKEN أو YOUTUBE_REFRESH_TOKEN مع GOOGLE_CLIENT_ID و GOOGLE_CLIENT_SECRET")
-    if not content.video_bytes:
-        return _unsupported("youtube", "يوتيوب يتطلب ملف فيديو. النص أو الصورة وحدهما غير مدعومين.")
-    try:
-        token = await _youtube_token(client, creds)
-    except RuntimeError as exc:
-        return _failed("youtube", str(exc))
-    if not token:
-        return _failed("youtube", "تعذر الحصول على رمز يوتيوب من .env.")
-    privacy = creds.youtube_privacy_status.strip() or "public"
-    if privacy not in {"public", "unlisted", "private"}:
-        privacy = "public"
-    metadata = {
-        "snippet": {"title": content.title, "description": content.caption[:5000], "categoryId": "22"},
-        "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False},
-    }
-    auth = {"Authorization": f"Bearer {token}"}
-    opened = await client.post(
-        "https://www.googleapis.com/upload/youtube/v3/videos",
-        params={"uploadType": "resumable", "part": "snippet,status"},
-        json=metadata,
-        headers={**auth, "X-Upload-Content-Type": content.video_mime or "video/mp4",
-                 "X-Upload-Content-Length": str(len(content.video_bytes))},
-    )
-    if opened.status_code >= 400:
-        return _failed("youtube", _error_text(opened))
-    location = opened.headers.get("location")
-    if not location:
-        return _failed("youtube", "يوتيوب لم يعِد جلسة رفع.")
-    uploaded = await client.put(
-        location, content=content.video_bytes,
-        headers={**auth, "Content-Type": content.video_mime or "video/mp4"},
-    )
-    if uploaded.status_code >= 400:
-        return _failed("youtube", _error_text(uploaded))
-    video_id = str(uploaded.json().get("id") or "")
-    return _published("youtube", video_id, f"https://www.youtube.com/watch?v={video_id}" if video_id else None)
-
-
-async def _publish_tiktok(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
-    if not creds.filled("tiktok_access_token"):
-        return _missing("tiktok", "TIKTOK_ACCESS_TOKEN")
-    token = creds.tiktok_access_token.strip()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=UTF-8"}
-    privacy = creds.tiktok_privacy_level.strip() or "SELF_ONLY"
-    if content.video_bytes:
-        return await _tiktok_video(client, headers, content, privacy)
-    if content.image_url and is_public_http_url(content.image_url):
-        response = await client.post("https://open.tiktokapis.com/v2/post/publish/content/init/", headers=headers, json={
-            "post_info": {"title": content.caption[:2200], "privacy_level": privacy},
-            "source_info": {"source": "PULL_FROM_URL", "photo_cover_index": 0, "photo_images": [content.image_url]},
-            "post_mode": "DIRECT_POST",
-            "media_type": "PHOTO",
-        })
-        if response.status_code >= 400:
-            return _failed("tiktok", _error_text(response))
-        data = response.json()
-        if (data.get("error") or {}).get("code") not in {None, "ok"}:
-            return _failed("tiktok", str(data["error"].get("message") or data["error"])[:300])
-        publish_id = str((data.get("data") or {}).get("publish_id") or "")
-        return _published("tiktok", publish_id, message=_tiktok_note(privacy))
-    if content.image_bytes:
-        return _failed("tiktok", _public_media_message("تيك توك للصور"))
-    return _unsupported("tiktok", "تيك توك يتطلب فيديو أو صورة على رابط عام.")
-
-
-async def _tiktok_video(client: httpx.AsyncClient, headers: dict, content: HubContent, privacy: str) -> PlatformResult:
-    video = content.video_bytes or b""
-    chunk = len(video) if len(video) <= 10 * 1024 * 1024 else 10 * 1024 * 1024
-    total = 1 if len(video) <= chunk else max(1, len(video) // chunk)
-    if total == 1:
-        chunk = len(video)
-    response = await client.post("https://open.tiktokapis.com/v2/post/publish/video/init/", headers=headers, json={
-        "post_info": {
-            "title": content.caption[:2200], "privacy_level": privacy,
-            "disable_duet": False, "disable_comment": False, "disable_stitch": False,
-        },
-        "source_info": {
-            "source": "FILE_UPLOAD", "video_size": len(video), "chunk_size": chunk, "total_chunk_count": total,
-        },
-    })
-    if response.status_code >= 400:
-        return _failed("tiktok", _error_text(response))
-    data = response.json()
-    error = data.get("error") or {}
-    if error.get("code") not in {None, "ok"}:
-        return _failed("tiktok", str(error.get("message") or error)[:300])
-    publish_id = str(data["data"]["publish_id"])
-    upload_url = data["data"]["upload_url"]
-    for index in range(total):
-        start = index * chunk
-        end = len(video) - 1 if index == total - 1 else start + chunk - 1
-        part = await client.put(
-            upload_url, content=video[start:end + 1],
-            headers={"Content-Type": content.video_mime or "video/mp4", "Content-Range": f"bytes {start}-{end}/{len(video)}"},
-        )
-        if part.status_code >= 400:
-            return _failed("tiktok", _error_text(part))
-    return _published("tiktok", publish_id, message=_tiktok_note(privacy))
-
-
-def _tiktok_note(privacy: str) -> str:
-    if privacy == "SELF_ONLY":
-        return "تم الإرسال. التطبيقات غير المراجعة على تيك توك تنشر بشكل خاص فقط (SELF_ONLY)."
-    return "تم النشر"
-
-
-async def _publish_pinterest(content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient) -> PlatformResult:
-    if not creds.filled("pinterest_access_token", "pinterest_board_id"):
-        return _missing("pinterest", "PINTEREST_ACCESS_TOKEN, PINTEREST_BOARD_ID")
-    headers = {"Authorization": f"Bearer {creds.pinterest_access_token.strip()}"}
-    description = content.caption[:800]
-    title = content.title
-    if content.image_bytes and not content.video_bytes:
-        source = {
-            "source_type": "image_base64",
-            "content_type": content.image_mime or "image/jpeg",
-            "data": base64.b64encode(content.image_bytes).decode(),
-        }
-    elif content.video_bytes:
-        media_id = await _pinterest_video(client, headers, content.video_bytes, content.video_mime or "video/mp4")
-        source = {"source_type": "video_id", "media_id": media_id, "cover_image_key_frame_time": 0}
-    elif is_public_http_url(content.image_url):
-        source = {"source_type": "image_url", "url": content.image_url}
-    else:
-        return _unsupported("pinterest", "بنترست يتطلب صورة أو فيديو.")
-    response = await client.post("https://api.pinterest.com/v5/pins", headers=headers, json={
-        "board_id": creds.pinterest_board_id.strip(),
-        "title": title,
-        "description": description,
-        "media_source": source,
-    })
-    if response.status_code >= 400:
-        return _failed("pinterest", _error_text(response))
-    pin = response.json()
-    pin_id = str(pin.get("id") or "")
-    return _published("pinterest", pin_id, pin.get("link") or (f"https://www.pinterest.com/pin/{pin_id}/" if pin_id else None))
-
-
-async def _pinterest_video(client: httpx.AsyncClient, headers: dict, data: bytes, mime: str) -> str:
-    registered = await client.post("https://api.pinterest.com/v5/media", headers=headers, json={"media_type": "video"})
-    if registered.status_code >= 400:
-        raise RuntimeError(_error_text(registered))
-    body = registered.json()
-    media_id = str(body["media_id"])
-    upload = body.get("upload_url")
-    fields = dict(body.get("upload_parameters") or {})
-    if not upload:
-        raise RuntimeError("Pinterest did not return an upload URL.")
-    sent = await client.post(upload, data=fields, files={"file": ("video", data, mime)})
-    if sent.status_code >= 400:
-        raise RuntimeError(_error_text(sent))
-    for _ in range(15):
-        status = await client.get(f"https://api.pinterest.com/v5/media/{media_id}", headers=headers)
-        if status.status_code >= 400:
-            raise RuntimeError(_error_text(status))
-        state = str(status.json().get("status") or "")
-        if state == "succeeded":
-            return media_id
-        if state == "failed":
-            raise RuntimeError("Pinterest failed to process the video.")
-        await _sleep(2)
-    raise RuntimeError("Pinterest is still processing the video.")
 
 
 SNAPCHAT_API = "https://businessapi.snapchat.com"
@@ -690,33 +376,79 @@ async def _publish_snapchat(content: HubContent, creds: SocialCredentials, clien
     return _published("snapchat", str(body.get("request_id") or media_id))
 
 
+def _zoho_only(platform: str) -> PlatformResult:
+    # Facebook, Instagram, X, YouTube, Pinterest, TikTok, and Threads have no direct
+    # integration in the hub anymore; they only publish through the connected Zoho Social
+    # portal. This fires only if ZOHO_* credentials in .env are missing/incomplete.
+    return PlatformResult(
+        platform, "missing_credentials",
+        "هذه المنصة تُنشر فقط عبر Zoho Social. أضف ZOHO_CLIENT_ID, ZOHO_CLIENT_SECRET, "
+        "ZOHO_REFRESH_TOKEN, ZOHO_PORTAL_ID, ZOHO_BRAND_ID في .env.",
+    )
+
+
+async def _publish_via_zoho(
+    platforms: list[str], content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient,
+) -> list[PlatformResult]:
+    """Fan a single post out to several networks in one Zoho Social API call."""
+    media_url = content.video_url or content.image_url
+    media_kind = "video" if content.video_url else ("image" if content.image_url else None)
+    if media_url and not is_public_http_url(media_url):
+        message = _public_media_message("Zoho Social")
+        return [_failed(platform, message) for platform in platforms]
+    media_bytes = content.video_bytes or content.image_bytes
+    try:
+        outcomes = await zoho_social.publish(
+            creds, client, platforms,
+            caption=content.caption, media_url=media_url, media_kind=media_kind,
+            media_bytes_len=len(media_bytes) if media_bytes else None,
+        )
+    except Exception as exc:
+        message = str(exc) or "تعذر الاتصال بزوهو سوشال"
+        return [_failed(platform, message) for platform in platforms]
+    results: list[PlatformResult] = []
+    for platform in platforms:
+        outcome = outcomes.get(platform)
+        if not outcome:
+            results.append(_failed(platform, "زوهو سوشال لم يُرجع نتيجة لهذه المنصة."))
+        elif outcome.get("ok"):
+            results.append(_published(platform, str(outcome.get("post_id") or ""), message=outcome.get("message") or "تم النشر عبر Zoho Social"))
+        else:
+            results.append(_failed(platform, outcome.get("message") or "تعذر النشر عبر Zoho Social"))
+    return results
+
+
+# Only the networks NOT connected inside Zoho Social still publish directly.
 _PUBLISHERS = {
-    "twitter": _publish_twitter,
     "linkedin": _publish_linkedin,
-    "instagram": _publish_instagram,
-    "youtube": _publish_youtube,
-    "tiktok": _publish_tiktok,
-    "pinterest": _publish_pinterest,
     "snapchat": _publish_snapchat,
 }
-
-
-async def _sleep(seconds: float) -> None:
-    import asyncio
-    await asyncio.sleep(seconds)
 
 
 async def publish_everywhere(platforms: list[str], content: HubContent, creds: SocialCredentials) -> list[PlatformResult]:
     timeout = httpx.Timeout(60.0, read=180.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # Platforms configured to go through the connected Zoho Social portal (see
+        # ZOHO_NETWORKS in .env) are fanned out in a single Zoho API call instead of
+        # calling TikTok/YouTube/X directly.
+        zoho_targets = [p for p in platforms if p in zoho_social.managed_platforms(creds)]
         results: list[PlatformResult] = []
+        if zoho_targets:
+            results.extend(await _publish_via_zoho(zoho_targets, content, creds, client))
         for platform in platforms:
+            if platform in zoho_targets:
+                continue
             publisher = _PUBLISHERS.get(platform)
             if publisher is None:
-                results.append(_failed(platform, "منصة غير معروفة."))
+                if platform in zoho_social.NETWORK_MAP:
+                    results.append(_zoho_only(platform))
+                else:
+                    results.append(_failed(platform, "منصة غير معروفة."))
                 continue
             try:
                 results.append(await publisher(content, creds, client))
             except Exception as exc:  # surface provider failures per network, keep the others going
                 results.append(_failed(platform, str(exc) or "تعذر النشر"))
+        order = {platform: index for index, platform in enumerate(platforms)}
+        results.sort(key=lambda item: order.get(item.platform, len(order)))
         return results
