@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -19,7 +18,6 @@ from app.core.database import get_sessionmaker
 from app.hub import zoho_social
 from app.hub.credentials import SocialCredentials, get_social_credentials
 from app.hub.publish import _error_text, _snapchat_bearer
-from app.hub.store import list_posts
 
 PLATFORM_NAMES = {
     "tiktok": "تيك توك",
@@ -196,88 +194,6 @@ async def _account_metrics(c: SocialCredentials) -> list[dict]:
     return metrics
 
 
-async def _post_metric(client: httpx.AsyncClient, c: SocialCredentials, post: dict, result: dict) -> dict:
-    platform = str(result.get("platform") or "")
-    external_id = str(result.get("external_id") or "")
-    base = {
-        "hub_post_id": str(post.get("id") or ""),
-        "platform": platform,
-        "external_post_id": external_id or None,
-        "available": False,
-        "reason": None,
-        "likes_count": None,
-        "comments_count": None,
-        "shares_count": None,
-        "views_count": None,
-        "captured_at": datetime.now(timezone.utc).isoformat(),
-        "raw": None,
-    }
-    if result.get("status") != "published" or not external_id:
-        base["reason"] = "لا يوجد معرّف منشور منشور على المنصة."
-        return base
-    response: httpx.Response | None = None
-    if platform == "linkedin" and c.filled("linkedin_access_token"):
-        response = await client.get(
-            f"https://api.linkedin.com/rest/socialActions/{quote(external_id, safe='')}",
-            headers={
-                "Authorization": f"Bearer {c.linkedin_access_token.strip()}",
-                "LinkedIn-Version": c.linkedin_api_version.strip() or "202506",
-                "X-Restli-Protocol-Version": "2.0.0",
-            },
-        )
-    else:
-        # Facebook, Instagram, X, YouTube, Pinterest, TikTok, and Threads are published
-        # through Zoho; their live engagement numbers come from the Zoho-sourced recent
-        # posts feed (GET /api/hub/posts) directly, not from this per-network lookup.
-        base["reason"] = "المنصة لا توفر مقاييس هذا المنشور بالصلاحيات الحالية."
-        return base
-    if response.status_code >= 400:
-        base["reason"] = _error_text(response)
-        return base
-    body = response.json()
-    values = {
-        "likes_count": (body.get("likesSummary") or {}).get("totalLikes"),
-        "comments_count": (body.get("commentsSummary") or {}).get("totalFirstLevelComments"),
-    }
-    base.update(values)
-    base.update({"available": True, "reason": None, "raw": body})
-    return base
-
-
-async def _publication_metrics(c: SocialCredentials) -> list[dict]:
-    jobs: list[tuple[dict, dict]] = []
-    for post in list_posts():
-        for result in post.get("results") or []:
-            jobs.append((post, result))
-    if not jobs:
-        return []
-    timeout = httpx.Timeout(30.0, read=60.0)
-    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        values = await asyncio.gather(
-            *(_post_metric(client, c, post, result) for post, result in jobs),
-            return_exceptions=True,
-        )
-    output: list[dict] = []
-    for (post, result), value in zip(jobs, values):
-        if isinstance(value, Exception):
-            output.append({
-                "hub_post_id": post.get("id"),
-                "platform": result.get("platform"),
-                "external_post_id": result.get("external_id"),
-                "available": False,
-                "reason": str(value),
-                "likes_count": None,
-                "comments_count": None,
-                "shares_count": None,
-                "views_count": None,
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "raw": None,
-            })
-        else:
-            output.append(value)
-    return output
-
-
 async def _save(accounts: list[dict], publications: list[dict]) -> None:
     async with get_sessionmaker()() as session:
         for item in accounts:
@@ -312,16 +228,17 @@ async def _save(accounts: list[dict], publications: list[dict]) -> None:
 
 
 async def sync_social_analytics() -> dict:
+    """Account-level metrics only. Per-post engagement used to come from our local post
+    record, which no longer exists (see app/hub/store.py's removal) — this server keeps no
+    record of hub posts at all now. Zoho-sourced posts already carry their own stats inline
+    (GET /api/hub/posts -> zoho_social.recent_posts()); `publications` stays empty here."""
     credentials = get_social_credentials()
-    accounts, publications = await asyncio.gather(
-        _account_metrics(credentials),
-        _publication_metrics(credentials),
-    )
-    await _save(accounts, publications)
+    accounts = await _account_metrics(credentials)
+    await _save(accounts, [])
     history = await analytics_history()
     return {
         "accounts": accounts,
-        "publications": publications,
+        "publications": [],
         "history": history,
         "captured_at": datetime.now(timezone.utc).isoformat(),
     }

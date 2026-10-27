@@ -43,7 +43,6 @@ class HubContent:
     caption: str
     image_bytes: bytes | None = None
     image_mime: str | None = None
-    image_url: str | None = None
     video_bytes: bytes | None = None
     video_mime: str | None = None
     video_url: str | None = None
@@ -80,14 +79,6 @@ def is_public_http_url(url: str | None) -> bool:
     if host in {"localhost", "127.0.0.1", "0.0.0.0"} or host.endswith(".local"):
         return False
     return True
-
-
-def _public_media_message(platform_name: str) -> str:
-    return (
-        f"{platform_name} يجب أن يحمّل الصورة أو الفيديو من رابط HTTPS عام. "
-        "ضع MEDIA_PUBLIC_BASE_URL في .env (رابط عام يصل إلى هذا الخادم)، "
-        "أو أرفق رابط فيديو/صورة عاماً."
-    )
 
 
 def _error_text(response: httpx.Response) -> str:
@@ -390,18 +381,30 @@ def _zoho_only(platform: str) -> PlatformResult:
 async def _publish_via_zoho(
     platforms: list[str], content: HubContent, creds: SocialCredentials, client: httpx.AsyncClient,
 ) -> list[PlatformResult]:
-    """Fan a single post out to several networks in one Zoho Social API call."""
-    media_url = content.video_url or content.image_url
-    media_kind = "video" if content.video_url else ("image" if content.image_url else None)
-    if media_url and not is_public_http_url(media_url):
-        message = _public_media_message("Zoho Social")
-        return [_failed(platform, message) for platform in platforms]
-    media_bytes = content.video_bytes or content.image_bytes
+    """Fan a single post out to several networks in one Zoho Social API call.
+
+    Images are sent as raw bytes and uploaded straight to Zoho (no public URL or local
+    file needed). Zoho Social's API has no direct video-upload endpoint, so a video must
+    already be a public HTTPS URL that Zoho can fetch."""
+    media_kind: str | None = None
+    media_url: str | None = None
+    media_bytes: bytes | None = None
+    media_mime: str | None = None
+    if content.video_url:
+        if not is_public_http_url(content.video_url):
+            message = (
+                "فيديو Zoho Social يجب أن يكون رابط HTTPS عاماً — رفع ملف فيديو مباشرة غير "
+                "مدعوم عبر واجهة Zoho Social الحالية (الصق رابط فيديو عاماً بدلاً من رفع ملف)."
+            )
+            return [_failed(platform, message) for platform in platforms]
+        media_kind, media_url = "video", content.video_url
+    elif content.image_bytes:
+        media_kind, media_bytes, media_mime = "image", content.image_bytes, content.image_mime
     try:
         outcomes = await zoho_social.publish(
             creds, client, platforms,
-            caption=content.caption, media_url=media_url, media_kind=media_kind,
-            media_bytes_len=len(media_bytes) if media_bytes else None,
+            caption=content.caption, media_kind=media_kind,
+            media_url=media_url, media_bytes=media_bytes, media_mime=media_mime,
         )
     except Exception as exc:
         message = str(exc) or "تعذر الاتصال بزوهو سوشال"

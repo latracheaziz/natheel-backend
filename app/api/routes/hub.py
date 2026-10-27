@@ -1,20 +1,24 @@
-"""Admin Social Media Hub: create a post on our platform and share it."""
+"""Admin Social Media Hub: create a post and share it to the connected networks.
+
+Nothing is ever saved on this server: there is no local database table or JSON/media file
+for hub posts, by design — this backend runs on a read-only filesystem in production
+(serverless), and more importantly Zoho Social is the single source of truth. Every
+published post lives only in Zoho (for the networks it manages) or directly on LinkedIn/
+Snapchat's own servers; `GET /posts` always reads the live feed, never a local copy."""
 from __future__ import annotations
 
-import mimetypes
 from datetime import datetime, timezone
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile
 
 from app.api.routes.reviews import require_admin_token
 from app.core.config import get_settings
 from app.hub import zoho_social
 from app.hub.analytics import analytics_history, sync_social_analytics
-from app.hub.credentials import CREDENTIALS_FILE, get_social_credentials
+from app.hub.credentials import get_social_credentials
 from app.hub.publish import PLATFORMS, HubContent, is_public_http_url, publish_everywhere, snapchat_account_check
-from app.hub.store import delete_post, list_posts, save_post
 
 def _hub_admin(authorization: str | None = Header(default=None)) -> str:
     return require_admin_token(authorization)
@@ -25,26 +29,6 @@ router = APIRouter(
     tags=["Social Media Hub"],
     dependencies=[Depends(_hub_admin)],
 )
-
-
-def _suffix(filename: str | None, mime: str | None, fallback: str) -> str:
-    if filename and "." in filename:
-        ext = "." + filename.rsplit(".", 1)[-1].lower()
-        if 1 < len(ext) <= 8:
-            return ext
-    guessed = mimetypes.guess_extension(mime or "") or ""
-    return guessed or fallback
-
-
-def _media_root():
-    from pathlib import Path
-
-    root = Path(get_settings().storage_local_path)
-    if not root.is_absolute():
-        root = CREDENTIALS_FILE.parent / root
-    folder = root / "hub"
-    folder.mkdir(parents=True, exist_ok=True)
-    return folder
 
 
 async def _read_upload(upload: UploadFile | None, limit: int, kind: str) -> tuple[bytes, str] | None:
@@ -76,15 +60,6 @@ async def _download(url: str, limit: int) -> tuple[bytes, str]:
     return b"".join(chunks), mime
 
 
-def _public_url(request: Request, key: str) -> str:
-    creds = get_social_credentials()
-    settings = get_settings()
-    base = (creds.media_public_base_url or settings.media_public_base_url or "").strip()
-    if not base:
-        base = str(request.base_url).rstrip("/") + "/media-files"
-    return f"{base.rstrip('/')}/{key}"
-
-
 @router.get("/status", summary="Which networks have credentials in .env")
 async def credential_status() -> dict:
     creds = get_social_credentials()
@@ -113,30 +88,21 @@ async def zoho_channels() -> dict:
         return await zoho_social.channel_check(client, creds)
 
 
-@router.get("/posts", summary="Posts created on this platform, merged with Zoho's live feed")
+@router.get("/posts", summary="Recent posts, live from Zoho Social")
 async def posts() -> dict:
-    """Our local record (every post made through this composer, any platform) plus Zoho
-    Social's own live "Published Posts" feed (any Zoho-managed network, even posts made
-    outside this tool), de-duplicated by the network's real post id."""
+    """Zoho Social's own live "Published Posts" feed — every network it manages for this
+    brand, even posts made outside this tool. Nothing is stored locally; LinkedIn/Snapchat
+    posts (the only two networks not routed through Zoho) are returned once, directly in
+    the `POST /posts` response at publish time, but have no history endpoint of their own."""
     creds = get_social_credentials()
-    local = [{**post, "source": "local"} for post in list_posts()]
-    known_ids = {
-        str(result.get("external_id"))
-        for post in local
-        for result in post.get("results") or []
-        if result.get("external_id")
-    }
-    zoho_posts: list[dict] = []
-    if creds.zoho_ready():
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
-            try:
-                zoho_posts = await zoho_social.recent_posts(client, creds)
-            except Exception:
-                zoho_posts = []
-    zoho_posts = [post for post in zoho_posts if post.get("external_id") not in known_ids]
-    combined = local + zoho_posts
-    combined.sort(key=lambda post: post.get("published_at") or post.get("created_at") or "", reverse=True)
-    return {"posts": combined}
+    if not creds.zoho_ready():
+        return {"posts": []}
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        try:
+            zoho_posts = await zoho_social.recent_posts(client, creds)
+        except Exception:
+            zoho_posts = []
+    return {"posts": zoho_posts}
 
 
 @router.get("/analytics", summary="Fetch real metrics from connected social providers")
@@ -156,26 +122,19 @@ async def metric_history() -> dict:
 
 @router.delete("/posts/{post_id}", summary="Delete a platform post record")
 async def remove_post(post_id: str) -> dict:
-    """Removes the post from our own local record. Zoho Social has no API to delete an
-    already-published post (only drafts/schedules) — so posts sourced live from Zoho
-    (id starting with "zoho:") have nothing local to delete; the frontend instead opens
-    the post's real network/Zoho link so it can be removed manually from there."""
-    if post_id.startswith("zoho:"):
-        raise HTTPException(
-            status_code=400,
-            detail="هذا المنشور من Zoho Social مباشرة ولا يوجد سجل محلي له. "
-                   "Zoho لا يوفر واجهة لحذف منشور نُشر فعلاً؛ افتح رابط المنشور لحذفه يدوياً.",
-        )
-    existing = next((item for item in list_posts() if item.get("id") == post_id), None)
-    if existing is None or not delete_post(post_id):
-        raise HTTPException(status_code=404, detail="المنشور غير موجود.")
-    manage_links = [item.get("url") for item in (existing.get("results") or []) if item.get("url")]
-    return {"success": True, "id": post_id, "manage_links": manage_links}
+    """Zoho Social has no API to delete an already-published post (only drafts/schedules),
+    and this server keeps no local copy to delete either — every post is sourced live from
+    Zoho or returned once at publish time. Open the post's real network/Zoho link to delete
+    it manually from there (the frontend already does this instead of calling this route)."""
+    raise HTTPException(
+        status_code=400,
+        detail="Zoho Social لا يوفر واجهة لحذف منشور نُشر فعلاً، ولا يحتفظ هذا الخادم بنسخة "
+               "محلية لحذفها. افتح رابط المنشور على الشبكة أو على Zoho لحذفه من هناك.",
+    )
 
 
 @router.post("/posts", summary="Create a post and share it to the selected networks")
 async def create_post(
-    request: Request,
     caption: str = Form(""),
     platforms: str = Form(""),
     video_url: str = Form(""),
@@ -183,6 +142,7 @@ async def create_post(
     video: UploadFile | None = File(None),
 ) -> dict:
     settings = get_settings()
+    creds = get_social_credentials()
     selected = [item.strip().lower() for item in platforms.split(",") if item.strip()]
     unknown = [item for item in selected if item not in PLATFORMS]
     if not selected:
@@ -208,40 +168,36 @@ async def create_post(
     video_mime = video_data[1] if video_data else None
     video_bytes = video_data[0] if video_data else None
     if remote_video and video_bytes is None:
+        # Downloaded into memory only — LinkedIn/Snapchat need raw bytes to upload a video
+        # directly to their own API; nothing is ever written to disk.
         try:
             video_bytes, video_mime = await _download(remote_video, settings.max_video_bytes)
         except Exception:
             video_bytes = None
             video_mime = "video/mp4"
 
-    folder = _media_root()
-    image_key = None
-    video_key = None
-    if image_data:
-        image_key = f"hub/{uuid4().hex}{_suffix(image.filename if image else None, image_data[1], '.jpg')}"
-        (folder.parent / image_key).parent.mkdir(parents=True, exist_ok=True)
-        (folder.parent / image_key).write_bytes(image_data[0])
-    if video_bytes and not remote_video:
-        video_key = f"hub/{uuid4().hex}{_suffix(video.filename if video else None, video_mime, '.mp4')}"
-        (folder.parent / video_key).write_bytes(video_bytes)
-    elif video_bytes and remote_video and not is_public_http_url(remote_video):
-        video_key = f"hub/{uuid4().hex}.mp4"
-        (folder.parent / video_key).write_bytes(video_bytes)
-
-    image_url = _public_url(request, image_key) if image_key else None
-    saved_video_url = _public_url(request, video_key) if video_key else None
-    share_video_url = remote_video if is_public_http_url(remote_video) else saved_video_url
+    # Zoho Social's API has no endpoint to upload a video file directly (only images) — a
+    # video destined for a Zoho-managed platform must already be a public HTTPS URL that
+    # Zoho can fetch itself. There is no local disk to host an uploaded file on either way.
+    zoho_targets = [p for p in selected if p in zoho_social.managed_platforms(creds)]
+    video_file_for_zoho = zoho_targets and (video_data or (remote_video and not is_public_http_url(remote_video)))
+    if video_file_for_zoho:
+        raise HTTPException(
+            status_code=400,
+            detail="فيديو منصات Zoho Social (" + "، ".join(zoho_targets) + ") يجب أن يكون رابط HTTPS "
+            "عاماً — رفع ملف فيديو مباشرة غير مدعوم لهذه المنصات. الصق رابط فيديو عاماً، أو ألغِ "
+            "تحديد هذه المنصات ووجّه الفيديو إلى لينكد إن/سناب شات فقط.",
+        )
 
     content = HubContent(
         caption=text,
         image_bytes=image_data[0] if image_data else None,
         image_mime=image_data[1] if image_data else None,
-        image_url=image_url,
         video_bytes=video_bytes,
         video_mime=video_mime,
-        video_url=share_video_url or (remote_video or None),
+        video_url=remote_video or None,
     )
-    results = await publish_everywhere(selected, content, get_social_credentials())
+    results = await publish_everywhere(selected, content, creds)
     published = [item.platform for item in results if item.status == "published"]
     if published and len(published) == len(results):
         status = "published"
@@ -250,17 +206,17 @@ async def create_post(
     else:
         status = "saved"
 
-    media_type = "video" if video_bytes or remote_video else "image" if image_data else "text"
+    # Nothing below is persisted anywhere: this is handed straight back to the admin UI,
+    # which adds it to the on-screen list itself. The real, durable record of this post is
+    # whatever `results` says got published — on Zoho Social, LinkedIn, and/or Snapchat.
+    media_type = "video" if (video_bytes or remote_video) else "image" if image_data else "text"
     post = {
         "id": uuid4().hex,
         "caption": text or "منشور جديد من شركة نثيل",
         "media_type": media_type,
-        "media_url": image_url or "",
-        "video_url": share_video_url or remote_video or "",
         "platforms": selected,
         "status": status,
         "published_at": datetime.now(timezone.utc).isoformat(),
         "results": [item.as_dict() for item in results],
     }
-    save_post(post)
     return {"success": True, "post": post, "results": post["results"]}

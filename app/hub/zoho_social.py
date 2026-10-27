@@ -212,17 +212,52 @@ def _media_object(media_url: str, media_kind: str, byte_length: int | None) -> d
     }
 
 
+async def upload_image(
+    client: httpx.AsyncClient, creds: SocialCredentials, token: str, data: bytes, mime: str | None,
+) -> dict:
+    """Uploads image bytes straight to Zoho (no public URL / local file needed) and returns
+    the media object (file_path + metadata) to place in a post's `medias` array.
+    Docs: https://www.zoho.com/social/api/image-upload-direct.html (JPEG/JPG/PNG/GIF only)."""
+    ext = (mimetypes.guess_extension(mime or "") or ".jpg").lstrip(".")
+    filename = f"natheel.{ext}"
+    response = await client.post(
+        f"{creds.zoho_api_domain.rstrip('/')}/social/v2/medias/upload",
+        headers=_headers(token, creds, json_body=False),
+        files={"file": (filename, data, mime or "image/jpeg")},
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(_error_text(response))
+    body = (response.json() or {}).get("data") or {}
+    file_path = body.get("file_path")
+    if not file_path:
+        raise RuntimeError("Zoho Social: تعذر رفع الصورة (لم يُرجع Zoho مساراً للملف).")
+    return {
+        "file_path": file_path,
+        "name": body.get("file_name") or filename,
+        "size": body.get("file_size") or len(data),
+        "type": "image",
+        "format": body.get("type") or ext,
+        "width": 0,
+        "height": 0,
+    }
+
+
 async def publish(
     creds: SocialCredentials,
     client: httpx.AsyncClient,
     platforms: list[str],
     *,
     caption: str,
-    media_url: str | None,
     media_kind: str | None,
-    media_bytes_len: int | None,
+    media_url: str | None = None,
+    media_bytes: bytes | None = None,
+    media_mime: str | None = None,
 ) -> dict[str, dict]:
     """Publish one post to the requested hub platforms via the Zoho Social unified API.
+
+    Images are uploaded directly to Zoho from memory (`media_bytes`) — no public URL or
+    local file ever needed. Zoho Social's API has no direct video-upload endpoint, so a
+    video must already be a public HTTPS URL (`media_url`); see `upload_image` above.
 
     Returns {hub_platform_id: {"ok": bool, "message": str, "post_id": str | None}}.
     """
@@ -248,8 +283,18 @@ async def publish(
         return pre_failed
 
     message_obj: dict = {"channels": channels, "message": caption, "has_media": media_kind or "none"}
-    if media_url:
-        message_obj["medias"] = [_media_object(media_url, media_kind or "image", media_bytes_len)]
+    if media_kind == "image" and media_bytes:
+        try:
+            message_obj["medias"] = [await upload_image(client, creds, token, media_bytes, media_mime)]
+        except Exception as exc:
+            failure = str(exc) or "تعذر رفع الصورة إلى Zoho Social"
+            sent_networks = [c["network"] for c in channels]
+            return {
+                **pre_failed,
+                **{PLATFORM_BY_NETWORK[n]: {"ok": False, "message": failure, "post_id": None} for n in sent_networks},
+            }
+    elif media_url:
+        message_obj["medias"] = [_media_object(media_url, media_kind or "image", None)]
     response = await client.post(
         f"{creds.zoho_api_domain.rstrip('/')}/social/v2/posts/publish",
         json={"post": {"messages": [message_obj]}},

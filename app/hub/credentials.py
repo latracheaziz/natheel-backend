@@ -16,8 +16,6 @@ class SocialCredentials(BaseSettings):
         extra="ignore",
     )
 
-    media_public_base_url: str = ""
-
     # LinkedIn and Snapchat are the only networks NOT connected inside Zoho Social, so they
     # keep their own direct tokens here. Every other network (Facebook, Instagram, X,
     # YouTube, Pinterest, TikTok, Threads) is published exclusively through Zoho below —
