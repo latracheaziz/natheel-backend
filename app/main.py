@@ -12,7 +12,8 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app.admin.auth import require_admin
 from app.admin.routes import public_router as admin_public_router
 from app.admin.routes import router as admin_router
-from app.api.routes import hub, media, oauth, posts, publishing, reviews, schedules, social_accounts
+from app.api.routes import (
+    emails, hub, media, news, oauth, posts, publishing, reviews, schedules, social_accounts)
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import register_exception_handlers
@@ -91,6 +92,9 @@ def create_app() -> FastAPI:
     app.include_router(api)
     app.include_router(hub.router)
     app.include_router(reviews.router)
+    app.include_router(news.router)
+    app.include_router(emails.public_router)  # OAuth callback: authorised by its single-use state
+    app.include_router(emails.router)
     app.include_router(admin_public_router)
     app.include_router(admin_router)
 

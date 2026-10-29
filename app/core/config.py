@@ -52,6 +52,20 @@ class Settings(BaseSettings):
     image_min_dimension: int = 100
     image_max_dimension: int = 8192
 
+    # --- Mailbox (admin "Emails" page) -------------------------------------------------
+    # Which mailbox provider to talk to. "gmail" uses the Gmail API with the GOOGLE_CLIENT_ID /
+    # GOOGLE_CLIENT_SECRET app below, and asks only for the gmail.modify scope (read + mark
+    # read/unread). No send scope is ever requested.
+    email_provider: str = "gmail"
+    email_login_hint: str = ""  # optional: pre-fills the account picker, e.g. contact@natheelco.com
+    email_page_size: int = 25
+    # Where the OAuth callback sends the browser back to once the mailbox is linked.
+    frontend_emails_path: str = "/adminnatheelcoir"
+
+    # --- Ministry of Tourism news ------------------------------------------------------
+    # How recently an article must have been published to be badged "new" in the admin panel.
+    news_new_days: int = 14
+
     # --- OAuth apps --------------------------------------------------------------------
     meta_client_id: str = ""
     meta_client_secret: SecretStr = SecretStr("")
@@ -117,6 +131,10 @@ class Settings(BaseSettings):
 
     def oauth_redirect_uri(self, platform: str) -> str:
         return f"{self.backend_public_url.rstrip('/')}/adminnatheel/social/{platform}/callback"
+
+    def email_redirect_uri(self) -> str:
+        """Must be registered verbatim as an authorised redirect URI on the Google OAuth client."""
+        return f"{self.backend_public_url.rstrip('/')}/api/emails/oauth/callback"
 
     @model_validator(mode="after")
     def _validate_production(self) -> "Settings":
