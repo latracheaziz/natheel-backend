@@ -13,7 +13,8 @@ from app.admin.auth import require_admin
 from app.admin.routes import public_router as admin_public_router
 from app.admin.routes import router as admin_router
 from app.api.routes import (
-    emails, hub, media, news, oauth, posts, publishing, reviews, schedules, social_accounts)
+    emails, hub, media, news, news_posts, oauth, posts, publishing, reviews, schedules,
+    social_accounts)
 from app.core.config import get_settings
 from app.core.database import dispose_engine
 from app.core.exceptions import register_exception_handlers
@@ -81,7 +82,10 @@ def create_app() -> FastAPI:
         if settings.is_production:
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         if request.url.path.startswith(("/api", "/adminnatheel")):
-            response.headers["Cache-Control"] = "no-store"
+            # API responses may carry admin data, so they are never cached — except the public
+            # news cover images, which are deliberately public bytes and set their own policy.
+            if not request.url.path.startswith("/api/public/"):
+                response.headers["Cache-Control"] = "no-store"
         return response
 
     register_exception_handlers(app)
@@ -93,6 +97,8 @@ def create_app() -> FastAPI:
     app.include_router(hub.router)
     app.include_router(reviews.router)
     app.include_router(news.router)
+    app.include_router(news_posts.router)
+    app.include_router(news_posts.public_router)
     app.include_router(emails.public_router)  # OAuth callback: authorised by its single-use state
     app.include_router(emails.router)
     app.include_router(admin_public_router)
